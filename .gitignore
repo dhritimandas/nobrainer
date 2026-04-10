@@ -136,3 +136,18 @@ dmypy.json
 
 # Cython debug symbols
 cython_debug/
+
+# pycharm
+.idea/
+
+# guide data
+guide/data/
+
+# Model artifacts
+*.pth
+brain_mask_extraction_model/
+data/
+
+# Model artifacts
+*.pth
+brain_mask_extraction_model/

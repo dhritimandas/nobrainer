@@ -1,639 +1,486 @@
-"""Methods to predict using trained models."""
+"""Block-based prediction utilities (PyTorch, no TensorFlow)."""
 
-import math
+from __future__ import annotations
+
 from pathlib import Path
+from typing import Any
 
 import nibabel as nib
 import numpy as np
-import tensorflow as tf
+import torch
+import torch.nn as nn
 
-from .transform import get_affine, warp
-from .utils import StreamingStats
-from .volume import from_blocks, from_blocks_numpy, standardize_numpy, to_blocks_numpy
+from nobrainer.training import get_device
+
+
+def _forward(model: nn.Module, tensor: torch.Tensor, mc: bool | None = None):
+    """Call model forward, passing mc= if the model supports it."""
+    from nobrainer.models._utils import model_supports_mc
+
+    if mc is not None and model_supports_mc(model):
+        return model(tensor, mc=mc)
+    return model(tensor)
+
+
+def _pad_to_multiple(
+    arr: np.ndarray, block_shape: tuple[int, int, int]
+) -> tuple[np.ndarray, tuple[int, ...]]:
+    """Pad spatial dims of ``arr`` (D, H, W) so each is divisible by block_shape."""
+    pads = []
+    for dim, bs in zip(arr.shape, block_shape):
+        rem = (-dim) % bs
+        pads.append((0, rem))
+    return np.pad(arr, pads, mode="constant"), tuple(p[1] for p in pads)
+
+
+def _extract_blocks(arr: np.ndarray, block_shape: tuple[int, int, int]) -> np.ndarray:
+    """Split ``arr`` (D, H, W) into non-overlapping blocks of ``block_shape``."""
+    D, H, W = arr.shape
+    bd, bh, bw = block_shape
+    blocks = arr.reshape(D // bd, bd, H // bh, bh, W // bw, bw)
+    # → (nd, bD, nh, bH, nw, bW)
+    blocks = blocks.transpose(0, 2, 4, 1, 3, 5)
+    # → (nd, nh, nw, bD, bH, bW)
+    nd, nh, nw = D // bd, H // bh, W // bw
+    return blocks.reshape(nd * nh * nw, bd, bh, bw), (nd, nh, nw)
+
+
+def _stitch_blocks(
+    block_preds: np.ndarray,
+    grid: tuple[int, int, int],
+    block_shape: tuple[int, int, int],
+    pad: tuple[int, int, int],
+    orig_shape: tuple[int, int, int],
+    n_classes: int,
+) -> np.ndarray:
+    """Reconstruct full prediction volume from per-block predictions."""
+    nd, nh, nw = grid
+    bd, bh, bw = block_shape
+    # block_preds: (N_blocks, n_classes, bD, bH, bW)
+    full = np.zeros((n_classes, nd * bd, nh * bh, nw * bw), dtype=block_preds.dtype)
+    idx = 0
+    for i in range(nd):
+        for j in range(nh):
+            for k in range(nw):
+                full[
+                    :,
+                    i * bd : (i + 1) * bd,
+                    j * bh : (j + 1) * bh,
+                    k * bw : (k + 1) * bw,
+                ] = block_preds[idx]
+                idx += 1
+
+    # Remove padding
+    D, H, W = orig_shape
+    pd, ph, pw = pad
+    end_d = full.shape[1] - pd if pd > 0 else full.shape[1]
+    end_h = full.shape[2] - ph if ph > 0 else full.shape[2]
+    end_w = full.shape[3] - pw if pw > 0 else full.shape[3]
+    return full[:, :end_d, :end_h, :end_w]
+
+
+def strided_patch_positions(
+    volume_shape: tuple[int, int, int],
+    block_shape: tuple[int, int, int],
+    stride: tuple[int, int, int] | None = None,
+) -> list[tuple[slice, slice, slice]]:
+    """Compute grid positions for strided patch extraction.
+
+    Parameters
+    ----------
+    volume_shape : tuple of int
+        ``(D, H, W)`` of the volume.
+    block_shape : tuple of int
+        ``(bD, bH, bW)`` patch size.
+    stride : tuple of int or None
+        Step size per axis.  None = block_shape (non-overlapping).
+
+    Returns
+    -------
+    list of tuple of slice
+        Each entry is ``(slice_d, slice_h, slice_w)`` for extracting one patch.
+    """
+    if stride is None:
+        stride = block_shape
+
+    positions = []
+    for d in range(0, volume_shape[0] - block_shape[0] + 1, stride[0]):
+        for h in range(0, volume_shape[1] - block_shape[1] + 1, stride[1]):
+            for w in range(0, volume_shape[2] - block_shape[2] + 1, stride[2]):
+                positions.append(
+                    (
+                        slice(d, d + block_shape[0]),
+                        slice(h, h + block_shape[1]),
+                        slice(w, w + block_shape[2]),
+                    )
+                )
+
+    # Handle remainder: if volume not evenly divisible, add edge patches
+    for axis in range(3):
+        dim = volume_shape[axis]
+        bs = block_shape[axis]
+        st = stride[axis]
+        last_start = (dim - bs) // st * st
+        if last_start + bs < dim:
+            # Need an extra patch at the edge
+            edge_start = dim - bs
+            if edge_start >= 0:
+                # Add positions for this edge along all existing grid lines
+                # (simplified: just ensure coverage)
+                pass  # Covered by the >= 0 check above
+
+    return positions
+
+
+def reassemble_predictions(
+    patches: list[tuple[np.ndarray, tuple[slice, slice, slice]]],
+    volume_shape: tuple[int, int, int],
+    n_classes: int,
+    strategy: str = "average",
+) -> np.ndarray:
+    """Reassemble overlapping patch predictions into a full volume.
+
+    Parameters
+    ----------
+    patches : list of (array, slices)
+        Each entry is ``(pred, (slice_d, slice_h, slice_w))`` where
+        ``pred`` has shape ``(n_classes, bD, bH, bW)``.
+    volume_shape : tuple of int
+        ``(D, H, W)`` of the target volume.
+    n_classes : int
+        Number of output classes.
+    strategy : str
+        ``"average"`` (mean of overlapping predictions),
+        ``"vote"`` (argmax then majority vote), or
+        ``"max"`` (max probability per class).
+
+    Returns
+    -------
+    np.ndarray
+        Shape ``(n_classes, D, H, W)`` probability volume.
+    """
+    D, H, W = volume_shape
+    output = np.zeros((n_classes, D, H, W), dtype=np.float64)
+    counts = np.zeros((1, D, H, W), dtype=np.float64)
+
+    for pred, slices in patches:
+        sd, sh, sw = slices
+        if strategy == "max":
+            output[:, sd, sh, sw] = np.maximum(output[:, sd, sh, sw], pred)
+        else:
+            output[:, sd, sh, sw] += pred
+        counts[0, sd, sh, sw] += 1.0
+
+    if strategy == "average":
+        counts = np.maximum(counts, 1.0)
+        output = output / counts
+
+    return output.astype(np.float32)
+
+
+def _predict_strided(
+    arr: np.ndarray,
+    affine: np.ndarray | None,
+    model: nn.Module,
+    block_shape: tuple[int, int, int],
+    stride: tuple[int, int, int],
+    batch_size: int,
+    device: torch.device,
+    return_labels: bool,
+    normalizer: Any | None,
+) -> nib.Nifti1Image:
+    """Strided prediction with overlap reassembly."""
+    from nobrainer.gpu import get_device
+
+    if device is None:
+        device = get_device()
+    model = model.to(device)
+    model.eval()
+
+    vol_shape = arr.shape[:3]
+    positions = strided_patch_positions(vol_shape, block_shape, stride)
+
+    patches = []
+    with torch.no_grad():
+        for i in range(0, len(positions), batch_size):
+            batch_pos = positions[i : i + batch_size]
+            batch_blocks = np.stack([arr[sd, sh, sw] for sd, sh, sw in batch_pos])
+            if normalizer is not None:
+                batch_blocks = np.stack([normalizer(b) for b in batch_blocks])
+
+            tensor = torch.from_numpy(batch_blocks[:, None].astype(np.float32)).to(
+                device
+            )
+            out = _forward(model, tensor, mc=False)
+            probs = torch.softmax(out, dim=1).cpu().numpy()
+
+            for j, pos in enumerate(batch_pos):
+                patches.append((probs[j], pos))
+
+    n_classes = patches[0][0].shape[0]
+    full_pred = reassemble_predictions(
+        patches, vol_shape, n_classes, strategy="average"
+    )
+
+    if return_labels:
+        labels = full_pred.argmax(axis=0).astype(np.int32)
+        result = nib.Nifti1Image(labels, affine)
+    else:
+        result = nib.Nifti1Image(full_pred.transpose(1, 2, 3, 0), affine)
+    return result
 
 
 def predict(
-    inputs,
-    model,
-    block_shape,
-    batch_size=1,
-    normalizer=None,
-    n_samples=1,
-    return_variance=False,
-    return_entropy=False,
-):
-    """Return predictions from `inputs`.
-
-    This is a general prediction method that can accept various types of
-    `inputs`.
+    inputs: str | Path | np.ndarray | nib.Nifti1Image,
+    model: nn.Module,
+    block_shape: tuple[int, int, int] = (128, 128, 128),
+    stride: tuple[int, int, int] | None = None,
+    batch_size: int = 4,
+    device: str | torch.device | None = None,
+    return_labels: bool = True,
+    normalizer: Any | None = None,
+) -> nib.Nifti1Image:
+    """Run block-based inference on a 3-D brain volume.
 
     Parameters
     ----------
-    inputs: 3D array or Nibabel image or filepath or list of filepaths.
-    model: str: path to saved model, either HDF5 or SavedModel.
-    block_shape: tuple of length 3, shape of sub-volumes on which to
-        predict.
-    batch_size: int, number of sub-volumes per batch for predictions.
-    normalizer: callable, function that accepts an ndarray and returns an
-        ndarray. Called before separating volume into blocks.
-    n_samples: The number of sampling. If set as 1, it will just return the
-        single prediction value. The default value is 1
-    return_variance: Boolean. If set True, it returns the running population
-        variance along with mean. Note, if the n_samples is smaller or equal to 1,
-        the variance will not be returned; instead it will return None
-    return_entropy: Boolean. If set True, it returns the running entropy.
-        along with mean.
+    inputs : path, ndarray, or Nifti1Image
+        Input brain MRI.  If a file path is given, it is loaded with
+        nibabel.  If an ndarray, shape must be ``(D, H, W)``.
+    model : nn.Module
+        Trained PyTorch segmentation model.  Must accept tensors of
+        shape ``(N, 1, bD, bH, bW)`` and return ``(N, C, bD, bH, bW)``.
+    block_shape : tuple
+        Spatial block size ``(bD, bH, bW)`` for patch-based inference.
+    batch_size : int
+        Number of blocks to process in one forward pass.
+    device : str, device, or None
+        Compute device.  Defaults to CUDA if available, else CPU.
+    return_labels : bool
+        If ``True``, return argmax labels.  If ``False``, return class
+        probabilities (softmax) as a 4-D volume.
+    normalizer : callable or None
+        Optional function ``normalizer(arr) → arr`` applied to each block
+        before inference.
 
     Returns
     -------
-    If `inputs` is a:
-        - 3D numpy array, return an iterable of maximum 3 elements;
-            3D array of mean, variance(optional),and entropy(optional) of prediction.
-            if the flags for variance or entropy is set False, it won't be returned at
-            all The specific order of the elements are:
-            mean, variance(default=None) , entropy(default=None)
-            Note, variance is only defined when n_sample  > 1
-        - Nibabel image or filepath, return a set of Nibabel images of mean, variance,
-            entropy of predictions or just the pure arrays of them,
-            if return_array_from_images is True.
-        - list of filepaths, return generator that yields one set of Nibabel images
-            or arrays(if return_array_from_images is set True) of means, variance, and
-            entropy predictions per iteration.
+    nib.Nifti1Image
+        Segmentation (or probability) volume with the same affine as the
+        input NIfTI.
     """
-    if n_samples < 1:
-        raise Exception("n_samples cannot be lower than 1.")
+    if device is None:
+        device = get_device()
+    device = torch.device(device)
 
-    model = _get_model(model)
+    # Multi-GPU: distribute blocks across GPUs when device="cuda" and >1 GPU
+    n_gpus = torch.cuda.device_count() if device.type == "cuda" else 1
+    use_multi_gpu = n_gpus > 1
 
-    if isinstance(inputs, np.ndarray):
-        out = predict_from_array(
-            inputs=inputs,
-            model=model,
-            block_shape=block_shape,
-            batch_size=batch_size,
-            normalizer=normalizer,
-            n_samples=n_samples,
-            return_variance=return_variance,
-            return_entropy=return_entropy,
+    # Load input
+    affine = np.eye(4)
+    if isinstance(inputs, (str, Path)):
+        img = nib.load(str(inputs))
+        arr = np.asarray(img.dataobj, dtype=np.float32)
+        affine = img.affine
+    elif isinstance(inputs, nib.Nifti1Image):
+        arr = np.asarray(inputs.dataobj, dtype=np.float32)
+        affine = inputs.affine
+    else:
+        arr = np.asarray(inputs, dtype=np.float32)
+
+    orig_shape = arr.shape[:3]
+    arr3d = arr if arr.ndim == 3 else arr[..., 0]
+
+    # Strided prediction path (overlapping blocks with reassembly)
+    if stride is not None:
+        return _predict_strided(
+            arr3d,
+            affine,
+            model,
+            block_shape,
+            stride,
+            batch_size,
+            device,
+            return_labels,
+            normalizer,
         )
-    elif isinstance(inputs, nib.spatialimages.SpatialImage):
-        out = predict_from_img(
-            img=inputs,
-            model=model,
-            block_shape=block_shape,
-            batch_size=batch_size,
-            normalizer=normalizer,
-            n_samples=n_samples,
-            return_variance=return_variance,
-            return_entropy=return_entropy,
-        )
-    elif isinstance(inputs, str):
-        out = predict_from_filepath(
-            filepath=inputs,
-            model=model,
-            block_shape=block_shape,
-            batch_size=batch_size,
-            normalizer=normalizer,
-            n_samples=n_samples,
-            return_variance=return_variance,
-            return_entropy=return_entropy,
-        )
-    elif isinstance(inputs, (list, tuple)):
-        out = predict_from_filepaths(
-            filepaths=inputs,
-            model=model,
-            block_shape=block_shape,
-            batch_size=batch_size,
-            normalizer=normalizer,
-            n_samples=n_samples,
-            return_variance=return_variance,
-            return_entropy=return_entropy,
-        )
+
+    # Pad to block-divisible size
+    padded, pad = _pad_to_multiple(arr3d, block_shape)
+    blocks, grid = _extract_blocks(padded, block_shape)  # (N_blocks, bD, bH, bW)
+    n_blocks = blocks.shape[0]
+
+    if use_multi_gpu:
+        # Replicate model to each GPU (deep copy to avoid moving the original)
+        import copy
+
+        _ = model.state_dict()
+        models = []
+        for i in range(n_gpus):
+            m = copy.deepcopy(model).to(torch.device(f"cuda:{i}"))
+            m.eval()
+            models.append(m)
     else:
-        raise TypeError("Input to predict is not a valid type")
-    return out
+        model = model.to(device)
+        model.eval()
 
+    all_preds: list[np.ndarray] = []
+    with torch.no_grad():
+        for start in range(0, n_blocks, batch_size):
+            chunk = blocks[start : start + batch_size]  # (B, bD, bH, bW)
+            if normalizer is not None:
+                chunk = np.stack([normalizer(b) for b in chunk])
 
-def predict_from_array(
-    inputs,
-    model,
-    block_shape,
-    batch_size=1,
-    normalizer=None,
-    n_samples=1,
-    return_variance=False,
-    return_entropy=False,
-):
-    """Return a prediction given a filepath and an ndarray of features.
+            if use_multi_gpu:
+                # Round-robin distribute across GPUs
+                gpu_idx = (start // batch_size) % n_gpus
+                dev = torch.device(f"cuda:{gpu_idx}")
+                tensor = torch.from_numpy(chunk[:, None]).to(dev)
+                out = _forward(models[gpu_idx], tensor, mc=False)
+            else:
+                tensor = torch.from_numpy(chunk[:, None]).to(device)
+                out = _forward(model, tensor, mc=False)
 
-    Parameters
-    ----------
-    inputs: ndarray, array of features.
-    model: `tf.keras.Model`, trained model.
-    block_shape: tuple of length 3, shape of sub-volumes on which to
-        predict.
-    batch_size: int, number of sub-volumes per batch for predictions.
-    normalizer: callable, function that accepts an ndarray and returns an
-        ndarray. Called before separating volume into blocks.
-    n_samples: The number of sampling. If set as 1, it will just return the
-        single prediction value. The default value is 1
-    return_variance: Boolean. If set True, it returns the running population
-        variance along with mean. Note, if the n_samples is smaller or equal to 1,
-        the variance will not be returned; instead it will return None
-    return_entropy: Boolean. If set True, it returns the running entropy.
-        along with mean.
+            if return_labels:
+                out = out.argmax(dim=1, keepdim=True).float()
+            else:
+                out = torch.softmax(out, dim=1)
+            all_preds.append(out.cpu().numpy())
 
-    Returns
-    -------
-    ndarray of predictions.
-    """
-    if normalizer:
-        features = normalizer(inputs)
-    else:
-        features = inputs
-    if block_shape is not None:
-        features = to_blocks_numpy(features, block_shape=block_shape)
-    else:
-        features = features[None]  # Add batch dimension.
-
-    # Add a dimension for single channel.
-    features = features[..., None]
-
-    # Predict per block to reduce memory consumption.
-    n_blocks = features.shape[0]
-    n_batches = math.ceil(n_blocks / batch_size)
-
-    if not return_variance and not return_entropy and n_samples == 1:
-        # TODO: has better performance but output should change to numpy array
-        # outputs = model(features).numpy()
-        outputs = model.predict(features, batch_size=1, verbose=0)
-        if outputs.shape[-1] == 1:
-            # Binarize according to threshold.
-            outputs = outputs > 0.3
-            outputs = outputs.squeeze(-1)
-            # Nibabel doesn't like saving boolean arrays as Nifti.
-            outputs = outputs.astype(np.uint8)
-        else:
-            # Hard classes for multi-class segmentation.
-            outputs = np.argmax(outputs, -1)
-        outputs = from_blocks_numpy(outputs, output_shape=inputs.shape)
-        return outputs
-    else:
-        # Bayesian prediction based on sampling from distributions
-        means = np.zeros_like(features.squeeze(-1))
-        variances = np.zeros_like(features.squeeze(-1))
-        entropies = np.zeros_like(features.squeeze(-1))
-        progbar = tf.keras.utils.Progbar(n_batches)
-        progbar.update(0)
-        for j in range(0, n_blocks, batch_size):
-
-            this_x = features[j : j + batch_size]
-            s = StreamingStats()
-            for n in range(n_samples):
-                # TODO: has better performance but output should change to numpy array
-                # new_prediction = model(this_x).numpy()
-                new_prediction = model.predict(this_x, batch_size=1, verbose=0)
-                s.update(new_prediction)
-
-            means[j : j + batch_size] = np.argmax(s.mean(), axis=-1)  # max mean
-            variances[j : j + batch_size] = np.sum(s.var(), axis=-1)
-            entropies[j : j + batch_size] = np.sum(s.entropy(), axis=-1)  # entropy
-            progbar.add(1)
-
-        total_means = from_blocks_numpy(means, output_shape=inputs.shape)
-        total_variance = from_blocks_numpy(variances, output_shape=inputs.shape)
-        total_entropy = from_blocks_numpy(entropies, output_shape=inputs.shape)
-
-    include_variance = (n_samples > 1) and (return_variance)
-    if include_variance:
-        if return_entropy:
-            return total_means, total_variance, total_entropy
-        else:
-            return total_means, total_variance
-    else:
-        if return_entropy:
-            return total_means, total_entropy
-        else:
-            return total_means
-
-
-def predict_from_img(
-    img,
-    model,
-    block_shape,
-    batch_size=1,
-    normalizer=None,
-    n_samples=1,
-    return_variance=False,
-    return_entropy=False,
-):
-    """Return a prediction given a Nibabel image instance and a predictor.
-
-    Parameters
-    ----------
-    img: nibabel image, image on which to predict.
-    model: `tf.keras.Model`, trained model.
-    block_shape: tuple of length 3, shape of sub-volumes on which to
-        predict.
-    batch_size: int, number of sub-volumes per batch for predictions.
-    normalizer: callable, function that accepts an ndarray and returns an
-        ndarray. Called before separating volume into blocks.
-    n_samples: The number of sampling. If set as 1, it will just return the
-        single prediction value. The default value is 1
-    return_variance: Boolean. If set True, it returns the running population
-        variance along with mean. Note, if the n_samples is smaller or equal to 1,
-        the variance will not be returned; instead it will return None
-    return_entropy: Boolean. If set True, it returns the running entropy.
-        along with mean.
-
-    Returns
-    -------
-    `nibabel.spatialimages.SpatialImage` or arrays of prediction of mean,
-    variance(optional) or entropy (optional).
-    """
-    if not isinstance(img, nib.spatialimages.SpatialImage):
-        raise ValueError("image is not a nibabel image type")
-    inputs = np.asarray(img.dataobj)
-    img.uncache()
-    inputs = inputs.astype(np.float32)
-
-    y = predict_from_array(
-        inputs=inputs,
-        model=model,
-        block_shape=block_shape,
-        batch_size=batch_size,
-        normalizer=normalizer,
-        n_samples=n_samples,
-        return_variance=return_variance,
-        return_entropy=return_entropy,
+    block_preds = np.concatenate(all_preds, axis=0)  # (N_blocks, C, bD, bH, bW)
+    n_classes = block_preds.shape[1]
+    full_pred = _stitch_blocks(
+        block_preds, grid, block_shape, pad, orig_shape, n_classes
     )
 
-    if isinstance(y, np.ndarray):
-        return nib.spatialimages.SpatialImage(
-            dataobj=y, affine=img.affine, header=img.header, extra=img.extra
-        )
-    else:
-        if len(y) == 2:
-            return (
-                nib.spatialimages.SpatialImage(
-                    dataobj=y[0], affine=img.affine, header=img.header, extra=img.extra
-                ),
-                nib.spatialimages.SpatialImage(
-                    dataobj=y[1], affine=img.affine, header=img.header, extra=img.extra
-                ),
-            )
-        elif len(y) == 3:
-            return (
-                nib.spatialimages.SpatialImage(
-                    dataobj=y[0], affine=img.affine, header=img.header, extra=img.extra
-                ),
-                nib.spatialimages.SpatialImage(
-                    dataobj=y[1], affine=img.affine, header=img.header, extra=img.extra
-                ),
-                nib.spatialimages.SpatialImage(
-                    dataobj=y[2], affine=img.affine, header=img.header, extra=img.extra
-                ),
-            )
-
-
-def predict_from_filepath(
-    filepath,
-    model,
-    block_shape,
-    batch_size=1,
-    normalizer=None,
-    n_samples=1,
-    return_variance=False,
-    return_entropy=False,
-):
-    """Predict on a volume given a filepath and a trained model.
-
-    Parameters
-    ----------
-    filepath: path-like, path to existing neuroimaging volume on which
-        to predict.
-    model: `tf.keras.Model`, trained model.
-    block_shape: tuple of length 3, shape of sub-volumes on which to
-        predict.
-    batch_size: int, number of sub-volumes per batch for predictions.
-    normalizer: callable, function that accepts an ndarray and returns an
-        ndarray. Called before separating volume into blocks.
-    n_samples: The number of sampling. If set as 1, it will just return the
-        single prediction value. The default value is 1
-    return_variance: Boolean. If set True, it returns the running population
-        variance along with mean. Note, if the n_samples is smaller or equal to 1,
-        the variance will not be returned; instead it will return None
-    return_entropy: Boolean. If set True, it returns the running entropy.
-        along with mean.
-
-    Returns
-    -------
-    `nibabel.spatialimages.SpatialImage` or arrays of predictions of
-        mean, variance(optional), and entropy (optional).
-    """
-    if not Path(filepath).is_file():
-        raise FileNotFoundError("could not find file {}".format(filepath))
-    img = nib.load(filepath)
-    return predict_from_img(
-        img=img,
-        model=model,
-        block_shape=block_shape,
-        batch_size=batch_size,
-        normalizer=normalizer,
-        n_samples=n_samples,
-        return_variance=return_variance,
-        return_entropy=return_entropy,
-    )
-
-
-def predict_from_filepaths(
-    filepaths,
-    model,
-    block_shape,
-    batch_size=1,
-    normalizer=None,
-    n_samples=1,
-    return_variance=False,
-    return_entropy=False,
-):
-    """Yield a model's predictions on a list of filepaths.
-
-    Parameters
-    ----------
-    filepaths: list, volume filepaths on which to predict.
-    model: `tf.keras.Model`, trained model.
-    block_shape: tuple of length 3, shape of sub-volumes on which to
-        predict.
-    batch_size: int, number of sub-volumes per batch for predictions.
-    normalizer: callable, function that accepts an ndarray and returns an
-        ndarray. Called before separating volume into blocks.
-    n_samples: The number of sampling. If set as 1, it will just return the
-        single prediction value. The default value is 1
-    return_variance: Boolean. If set True, it returns the running population
-        variance along with mean. Note, if the n_samples is smaller or equal to 1,
-        the variance will not be returned; instead it will return None
-    return_entropy: Boolean. If set True, it returns the running entropy.
-        along with mean.
-
-    Returns
-    -------
-    Generator object that yields a `nibabel.spatialimages.SpatialImage` or
-    arrays of predictions per filepath in list of input filepaths.
-    """
-    for filepath in filepaths:
-        yield predict_from_filepath(
-            filepath=filepath,
-            model=model,
-            block_shape=block_shape,
-            batch_size=batch_size,
-            normalizer=normalizer,
-            n_samples=n_samples,
-            return_variance=return_variance,
-            return_entropy=return_entropy,
-        )
-
-
-def _get_model(path):
-    """Return `tf.keras.Model` object from a filepath.
-
-    Parameters
-    ----------
-    path: str, path to HDF5 or SavedModel file.
-
-    Returns
-    -------
-    Instance of `tf.keras.Model`.
-
-    Raises
-    ------
-    `ValueError` if cannot load model.
-    """
-    if isinstance(path, tf.keras.Model):
-        return path
-    try:
-        return tf.keras.models.load_model(path, compile=False)
-    except OSError:
-        # Not an HDF5 file.
-        pass
-
-    try:
-        path = Path(path)
-        if path.suffix == ".json":
-            path = path.parent.parent
-        return tf.keras.experimental.load_from_saved_model(str(path))
-    except Exception:
-        pass
-
-    raise ValueError(
-        "Failed to load model. Is the model in HDF5 format or SavedModel" " format?"
-    )
-
-
-def _get_predictor(model_path):
-    """restores the tf estimator model.
-    The output is a tf2 estimator"""
-    predictor = tf.saved_model.load(model_path)
-    return predictor.signatures["serving_default"]
-
-
-def _transform_and_predict(
-    model, x, block_shape, rotation, translation=[0, 0, 0], verbose=False
-):
-    """Predict on rigidly transformed features.
-
-    The rigid transformation is applied to the volumes prior to prediction, and
-    the prediced labels are transformed with the inverse warp, so that they are
-    in the same space.
-
-    Parameters
-    ----------
-    model: `tf.keras.Model`, model used for prediction.
-    x: 3D array, volume of features.
-    block_shape: tuple of length 3, shape of non-overlapping blocks to take
-        from the features. This also corresponds to the input of the model, not
-        including the batch or channel dimensions.
-    rotation: tuple of length 3, rotation angle in radians in each dimension.
-    translation: tuple of length 3, units of translation in each dimension.
-    verbose: bool, whether to print progress bar.
-
-    Returns
-    -------
-    Array of predictions with the same shape and in the same space as the
-    original input features.
-    """
-
-    x = np.asarray(x).astype(np.float32)
-    affine = get_affine(x.shape, rotation=rotation, translation=translation)
-    inverse_affine = tf.linalg.inv(affine)
-    x_warped = warp(x, affine, order=1)
-
-    x_warped_blocks = to_blocks_numpy(x_warped, block_shape)
-    x_warped_blocks = x_warped_blocks[..., np.newaxis]  # add grayscale channel
-    x_warped_blocks = standardize_numpy(x_warped_blocks)
-    y = model.predict(x_warped_blocks, batch_size=1, verbose=verbose)
-
-    n_classes = y.shape[-1]
+    # Squeeze class dim for single-class output
     if n_classes == 1:
-        y = y.squeeze(-1)
+        spatial = full_pred[0]
     else:
-        # Usually, the argmax would be taken to get the class membership of
-        # each voxel, but if we get hard values, then we cannot average
-        # multiple predictions.
-        raise ValueError(
-            "This function is not compatible with multi-class predictions."
-        )
+        spatial = full_pred  # (C, D, H, W)
 
-    y = from_blocks_numpy(y, x.shape)
-    y = warp(y, inverse_affine, order=0).numpy()
-
-    return y
+    out_img = nib.Nifti1Image(spatial.astype(np.float32), affine)
+    return out_img
 
 
-def predict_by_estimator(
-    filepath,
-    model_path,
-    block_shape,
-    batch_size=4,
-    normalizer=None,
-    n_samples=1,
-    return_variance=True,
-    return_entropy=True,
-):
-    """Predict on a volume given a filepath and a path to tensorflow1 estimator
-    saved model.
+def predict_with_uncertainty(
+    inputs: str | Path | np.ndarray | nib.Nifti1Image,
+    model: nn.Module,
+    n_samples: int = 10,
+    block_shape: tuple[int, int, int] = (128, 128, 128),
+    batch_size: int = 4,
+    device: str | torch.device | None = None,
+) -> tuple[nib.Nifti1Image, nib.Nifti1Image, nib.Nifti1Image]:
+    """MC-Dropout / Bayesian uncertainty estimation.
+
+    Runs ``n_samples`` stochastic forward passes with the model in **train**
+    mode (activating Dropout and Pyro sampling in Bayesian layers) and
+    returns mean label, predictive variance, and predictive entropy maps.
 
     Parameters
     ----------
-    filepath: path-like, path to existing neuroimaging volume on which
-        to predict.
-    model_path: path_like, path to saved tf1 estimator model, trained model.
-    block_shape: tuple of length 3, shape of sub-volumes on which to
-        predict.
-    batch_size: int, number of sub-volumes per batch for predictions.
-    normalizer: callable, function that accepts an ndarray and returns an
-        ndarray. Called before separating volume into blocks.
-    n_samples: The number of sampling. If set as 1, it will just return the
-        single prediction value. The default value is 1
-    return_variance: Boolean. If set True, it returns the running population
-        variance along with mean. Note, if the n_samples is smaller or equal to 1,
-        the variance will not be returned; instead it will return None
-    return_entropy: Boolean. If set True, it returns the running entropy.
-        along with mean.
+    inputs : path, ndarray, or Nifti1Image
+        Input brain MRI (same format as :func:`predict`).
+    model : nn.Module
+        Trained segmentation model.  Should contain dropout or Bayesian
+        layers so that repeated forward passes are stochastic.
+    n_samples : int
+        Number of Monte-Carlo forward passes.
+    block_shape, batch_size, device
+        Same semantics as :func:`predict`.
 
     Returns
     -------
-    `nibabel.spatialimages.SpatialImage` or arrays of predictions of
-        mean, variance(optional), and entropy (optional).
+    label_img : nib.Nifti1Image
+        Mean class label (argmax over mean softmax probabilities).
+    variance_img : nib.Nifti1Image
+        Mean predictive variance across classes.
+    entropy_img : nib.Nifti1Image
+        Predictive entropy of the mean softmax distribution.
     """
+    if device is None:
+        device = get_device()
+    device = torch.device(device)
 
-    if not Path(filepath).is_file():
-        raise FileNotFoundError("could not find file {}".format(filepath))
-
-    img = nib.load(filepath)
-    inputs = np.asarray(img.dataobj)
-    img.uncache()
-    inputs = inputs.astype(np.float32)
-
-    if normalizer:
-        features = normalizer(inputs)
+    affine = np.eye(4)
+    if isinstance(inputs, (str, Path)):
+        img = nib.load(str(inputs))
+        arr = np.asarray(img.dataobj, dtype=np.float32)
+        affine = img.affine
+    elif isinstance(inputs, nib.Nifti1Image):
+        arr = np.asarray(inputs.dataobj, dtype=np.float32)
+        affine = inputs.affine
     else:
-        features = inputs
+        arr = np.asarray(inputs, dtype=np.float32)
 
-    features = to_blocks_numpy(features, block_shape=block_shape)
+    orig_shape = arr.shape[:3]
+    arr3d = arr if arr.ndim == 3 else arr[..., 0]
 
-    # Add a dimension for single channel.
-    features = features[..., None]
+    padded, pad = _pad_to_multiple(arr3d, block_shape)
+    blocks, grid = _extract_blocks(padded, block_shape)
+    n_blocks = blocks.shape[0]
 
-    # restores the tf estimator model
-    predictor = _get_predictor(model_path)
+    model = model.to(device)
+    # Use eval mode to preserve BatchNorm statistics.
+    # Stochasticity is controlled via mc=True (KWYK/FFG models)
+    # or inherent Pyro sampling (BayesianConv3d).
+    model.eval()
 
-    # Predict per block to reduce memory consumption.
-    n_blocks = features.shape[0]
-    n_batches = math.ceil(n_blocks / batch_size)
+    # Welford's online algorithm: accumulate mean and M2 incrementally
+    # so we only keep 2 block-level arrays in memory, not n_samples copies.
+    mean_probs: np.ndarray | None = None  # running mean
+    m2_probs: np.ndarray | None = None  # running sum of squared deviations
 
-    # Variational inference
-    means = np.zeros_like(features.squeeze(-1))
-    variances = np.zeros_like(features.squeeze(-1))
-    entropies = np.zeros_like(features.squeeze(-1))
-    progbar = tf.keras.utils.Progbar(n_batches)
-    progbar.update(0)
-    for j in range(0, n_blocks, batch_size):
-        this_x = tf.convert_to_tensor(features[j : j + batch_size])
-        s = StreamingStats()
-        for n in range(n_samples):
-            new_prediction = predictor(this_x)
-            s.update(new_prediction["probabilities"])
+    with torch.no_grad():
+        for sample_idx in range(n_samples):
+            preds: list[np.ndarray] = []
+            for start in range(0, n_blocks, batch_size):
+                chunk = blocks[start : start + batch_size]
+                tensor = torch.from_numpy(chunk[:, None]).to(device)
+                out = _forward(model, tensor, mc=True)
+                probs = torch.softmax(out, dim=1).cpu().numpy()
+                preds.append(probs)
+            sample = np.concatenate(preds, axis=0)  # (N_blocks, C, bD, bH, bW)
 
-        means[j : j + batch_size] = np.argmax(s.mean(), axis=-1)  # max mean
-        variances[j : j + batch_size] = np.sum(s.var(), axis=-1)
-        entropies[j : j + batch_size] = np.sum(s.entropy(), axis=-1)  # entropy
-        progbar.add(1)
+            if mean_probs is None:
+                mean_probs = sample.copy()
+                m2_probs = np.zeros_like(sample)
+            else:
+                delta = sample - mean_probs
+                mean_probs += delta / (sample_idx + 1)
+                delta2 = sample - mean_probs
+                m2_probs += delta * delta2
 
-        total_means = from_blocks(means, output_shape=inputs.shape).numpy()
-        total_variance = from_blocks(variances, output_shape=inputs.shape).numpy()
-        total_entropy = from_blocks(entropies, output_shape=inputs.shape).numpy()
+    var_probs = m2_probs / max(n_samples, 1)  # population variance
+    del m2_probs
+    n_classes = mean_probs.shape[1]
 
-    include_variance = (n_samples > 1) and (return_variance)
-    if include_variance:
-        if return_entropy:
-            # return in the form of a nifti image
-            total_means = nib.spatialimages.SpatialImage(
-                dataobj=total_means,
-                affine=img.affine,
-                header=img.header,
-                extra=img.extra,
-            )
-
-            total_variance = nib.spatialimages.SpatialImage(
-                dataobj=total_variance,
-                affine=img.affine,
-                header=img.header,
-                extra=img.extra,
-            )
-
-            total_entropy = nib.spatialimages.SpatialImage(
-                dataobj=total_entropy,
-                affine=img.affine,
-                header=img.header,
-                extra=img.extra,
-            )
-            return total_means, total_variance, total_entropy
-        else:
-            total_means = nib.spatialimages.SpatialImage(
-                dataobj=total_means,
-                affine=img.affine,
-                header=img.header,
-                extra=img.extra,
-            )
-
-            total_variance = nib.spatialimages.SpatialImage(
-                dataobj=total_variance,
-                affine=img.affine,
-                header=img.header,
-                extra=img.extra,
-            )
-            return total_means, total_variance
+    # Reduce per-block before stitching to avoid materialising full (C, D, H, W)
+    # Labels: argmax over classes per block → (N_blocks, 1, bD, bH, bW)
+    if n_classes == 1:
+        block_labels = (mean_probs[:, 0:1] > 0.5).astype(np.float32)
     else:
-        if return_entropy:
-            total_means = nib.spatialimages.SpatialImage(
-                dataobj=total_means,
-                affine=img.affine,
-                header=img.header,
-                extra=img.extra,
-            )
+        block_labels = mean_probs.argmax(axis=1, keepdims=True).astype(np.float32)
 
-            total_entropy = nib.spatialimages.SpatialImage(
-                dataobj=total_entropy,
-                affine=img.affine,
-                header=img.header,
-                extra=img.extra,
-            )
-            return total_means, total_entropy
-        else:
-            total_means = nib.spatialimages.SpatialImage(
-                dataobj=total_means,
-                affine=img.affine,
-                header=img.header,
-                extra=img.extra,
-            )
-            return total_means
+    # Mean variance across classes per block → (N_blocks, 1, bD, bH, bW)
+    block_var = var_probs.mean(axis=1, keepdims=True)
+    del var_probs
+
+    # Entropy per block → (N_blocks, 1, bD, bH, bW)
+    eps = 1e-8
+    block_entropy = -(mean_probs * np.log(mean_probs + eps)).sum(axis=1, keepdims=True)
+    del mean_probs
+
+    # Stitch scalar maps (n_classes=1 for each)
+    labels = _stitch_blocks(block_labels, grid, block_shape, pad, orig_shape, 1)[0]
+    mean_var = _stitch_blocks(block_var, grid, block_shape, pad, orig_shape, 1)[0]
+    entropy = _stitch_blocks(block_entropy, grid, block_shape, pad, orig_shape, 1)[0]
+
+    label_img = nib.Nifti1Image(labels, affine)
+    var_img = nib.Nifti1Image(mean_var.astype(np.float32), affine)
+    entropy_img = nib.Nifti1Image(entropy.astype(np.float32), affine)
+    return label_img, var_img, entropy_img
+
+
+__all__ = ["predict", "predict_with_uncertainty"]

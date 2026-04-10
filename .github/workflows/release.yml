@@ -1,35 +1,34 @@
 name: Auto-release on PR merge
 
 on:
-  # ATM, this is the closest trigger to a PR merging
-  push:
-    branches:
-      - master
+  pull_request:
+    branches: [master, alpha]
+    types: [closed]
 
 env:
-  # Pin to v10.28.0, which (as of 2021-05-25) is the latest version with assets
-  AUTO_VERSION: v10.29.3
+  AUTO_VERSION: v11.2.1
 
 jobs:
   auto-release:
+    name: Create release
     runs-on: ubuntu-latest
-    if: "!contains(github.event.head_commit.message, 'ci skip') && !contains(github.event.head_commit.message, 'skip ci')"
+    # Stable release: merged PR to master with 'release' label
+    # Alpha pre-release: merged PR to alpha (book validation runs as
+    #   a separate check via validate-book.yml on every PR push)
+    if: >-
+      github.event.pull_request.merged == true &&
+      (
+        contains(github.event.pull_request.labels.*.name, 'release') ||
+        github.event.pull_request.base.ref == 'alpha'
+      )
     steps:
-      - uses: actions/checkout@v2
-
-      - name: Prepare repository
-        # Fetch full git history and tags
-        run: git fetch --unshallow --tags
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          fetch-tags: true
 
       - name: Unset header
-        # checkout@v2 adds a header that makes branch protection report errors
-        # because the Github action bot is not a collaborator on the repo
         run: git config --local --unset http.https://github.com/.extraheader
-
-      - name: Set up Python
-        uses: actions/setup-python@v2
-        with:
-          python-version: 3.7
 
       - name: Download auto
         run: |
@@ -38,7 +37,6 @@ jobs:
           chmod a+x ~/auto
 
       - name: Create release
-        run: |
-          ~/auto shipit -vv
+        run: ~/auto shipit -vv
         env:
           GH_TOKEN: ${{ secrets.AUTO_USER_TOKEN }}

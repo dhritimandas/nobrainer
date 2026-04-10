@@ -1,0 +1,52 @@
+name: Validate nobrainer-book tutorials
+
+on:
+  workflow_dispatch:  # Manual trigger only — not part of CI checks
+
+jobs:
+  validate-book:
+    name: Run nobrainer-book tutorials
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v4
+
+      - name: Set up Python
+        run: uv venv --python 3.14
+
+      - name: Install nobrainer and tutorial deps from PR branch
+        run: |
+          uv pip install \
+            ".[bayesian,generative,zarr,dev]" \
+            monai \
+            pyro-ppl \
+            matplotlib \
+            nilearn
+
+      - name: Clone nobrainer-book (matching branch or alpha)
+        run: |
+          PR_BRANCH="${{ github.head_ref }}"
+          BOOK_REPO="https://github.com/neuronets/nobrainer-book.git"
+
+          # Try the PR's branch name first (for lockstep development),
+          # fall back to alpha
+          if git ls-remote --heads "$BOOK_REPO" "$PR_BRANCH" | grep -q .; then
+            echo "Using matching book branch: $PR_BRANCH"
+            git clone --branch "$PR_BRANCH" --depth 1 "$BOOK_REPO" /tmp/nobrainer-book
+          else
+            echo "No matching branch '$PR_BRANCH' on nobrainer-book, using alpha"
+            git clone --branch alpha --depth 1 "$BOOK_REPO" /tmp/nobrainer-book
+          fi
+
+      - name: Run book tutorials
+        run: |
+          for script in /tmp/nobrainer-book/docs/nobrainer-guides/scripts/0*.py /tmp/nobrainer-book/docs/nobrainer-guides/scripts/1[01]*.py; do
+            echo "=== Running $(basename $script) ==="
+            uv run python "$script" || {
+              echo "FAILED: $script"
+              exit 1
+            }
+          done
+          echo "All book tutorials passed"
