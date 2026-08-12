@@ -668,6 +668,140 @@ def zarr_suggest_shards(n_volumes, volume_shape, dtype, n_input_files, levels):
     click.echo(json.dumps(result, indent=2))
 
 
+# ---------------------------------------------------------------------------
+# export subcommands
+# ---------------------------------------------------------------------------
+
+
+@cli.group()
+def export():
+    """Export trained models to interoperable formats."""
+
+
+@export.command("bundle")
+@click.argument("model_dir", type=click.Path(exists=True))
+@click.argument("output", type=click.Path())
+@click.option(
+    "--no-torchscript",
+    is_flag=True,
+    help="Skip TorchScript export (models/model.ts).",
+)
+@click.option(
+    "--trace",
+    is_flag=True,
+    help=(
+        "Force torch.jit.trace instead of torch.jit.script. Bakes in a "
+        "fixed input shape; not the automatic fallback for a script failure."
+    ),
+)
+@click.option(
+    "--allow-stochastic",
+    is_flag=True,
+    help=(
+        "Allow exporting a model whose output differs across two identical "
+        "forward passes (Bayesian/MC models)."
+    ),
+)
+@click.option(
+    "--spatial-shape",
+    default=None,
+    help="Override spatial patch shape as D,H,W (default: provenance block_shape).",
+)
+@click.option(
+    "--version",
+    "bundle_version",
+    default="0.0.1",
+    help="Bundle version string.",
+    **_option_kwds,
+)
+@click.option("--name", default=None, help="Bundle display name.")
+@click.option("--task", default=None, help="Task description.")
+@click.option("--description", default=None, help="Longer description.")
+@click.option(
+    "--authors",
+    default="nobrainer contributors",
+    help="Author string.",
+    **_option_kwds,
+)
+@click.option(
+    "--copyright",
+    "copyright_",
+    default="Copyright (c) nobrainer contributors",
+    help="Copyright string.",
+    **_option_kwds,
+)
+@click.option(
+    "--labels",
+    default=None,
+    help="Comma-separated class label names, index 0 (background) first.",
+)
+@click.option(
+    "--reference",
+    "references",
+    multiple=True,
+    help="Reference citation (repeatable).",
+)
+@click.option(
+    "--no-verify",
+    is_flag=True,
+    help="Skip `python -m monai.bundle verify_metadata` after writing.",
+)
+def export_bundle_cmd(
+    *,
+    model_dir,
+    output,
+    no_torchscript,
+    trace,
+    allow_stochastic,
+    spatial_shape,
+    bundle_version,
+    name,
+    task,
+    description,
+    authors,
+    copyright_,
+    labels,
+    references,
+    no_verify,
+):
+    """Export a trained nobrainer model as a MONAI bundle.
+
+    MODEL_DIR is a directory written by Segmentation.save() (model.pth +
+    croissant.json). OUTPUT is the bundle directory to create; it must not
+    already exist.
+    """
+    from ..export.bundle import BundleExportError, export_bundle
+
+    shape = None
+    if spatial_shape:
+        shape = tuple(int(x) for x in spatial_shape.split(","))
+    label_list = labels.split(",") if labels else None
+
+    try:
+        out = export_bundle(
+            model_dir,
+            output,
+            torchscript=not no_torchscript,
+            trace=trace,
+            allow_stochastic=allow_stochastic,
+            spatial_shape=shape,
+            version=bundle_version,
+            name=name,
+            task=task,
+            description=description,
+            authors=authors,
+            copyright_=copyright_,
+            labels=label_list,
+            references=list(references) or None,
+            verify=not no_verify,
+        )
+    except BundleExportError as exc:
+        click.echo(click.style(f"ERROR: {exc}", fg="red"))
+        sys.exit(1)
+
+    click.echo(click.style(f"Bundle exported: {out}", fg="green"))
+
+
 # For debugging only.
 if __name__ == "__main__":
     cli()
