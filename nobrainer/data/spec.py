@@ -143,6 +143,35 @@ class DataSpec:
             zarr_levels=zarr_levels,
         )
 
+    @classmethod
+    def from_bids(cls, root: str | Path, **kwargs) -> DataSpec:
+        """Build a ``DataSpec`` from a BIDS (or BIDS-Derivatives) dataset.
+
+        Delegates discovery to :func:`nobrainer.data.bids.scan_bids`, which
+        logs a warning for every skipped file with its reason. Only
+        ``entries`` is populated -- file presence and header validation are
+        not performed here. Call :func:`validate` on the result to get the
+        same git-annex-aware checks (:func:`check_file_presence`) that
+        :meth:`from_json` specs go through.
+
+        Parameters
+        ----------
+        root : str or Path
+            BIDS dataset root (containing ``sub-*`` directories).
+        **kwargs
+            Forwarded to :func:`nobrainer.data.bids.scan_bids` (``suffix``,
+            ``label_suffix``, ``derivatives_dir``, ``session``,
+            ``require_labels``, ``backend``).
+
+        Returns
+        -------
+        DataSpec
+        """
+        from .bids import scan_bids
+
+        result = scan_bids(root, **kwargs)
+        return cls(entries=result.entries)
+
     def to_json(self, path: str | Path) -> None:
         """Write this spec to a JSON manifest file."""
         data: dict = {"entries": self.entries}

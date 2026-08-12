@@ -846,6 +846,198 @@ def zarr_suggest_shards(n_volumes, volume_shape, dtype, n_input_files, levels):
     click.echo(json.dumps(result, indent=2))
 
 
+# ---------------------------------------------------------------------------
+# data subcommands (BIDS <-> DataSpec)
+# ---------------------------------------------------------------------------
+
+
+@cli.group()
+def data():
+    """BIDS dataset discovery and reshaping commands."""
+
+
+@data.command("from-bids")
+@click.argument("root", type=click.Path(exists=True, file_okay=False))
+@click.argument("output", type=click.Path())
+@click.option(
+    "--suffix",
+    default="T1w",
+    help="Raw anat suffix to use as the image.",
+    **_option_kwds,
+)
+@click.option(
+    "--label-suffix",
+    default="dseg",
+    help="Derivative suffix to use as the label.",
+    **_option_kwds,
+)
+@click.option(
+    "--derivatives-dir",
+    default=None,
+    type=click.Path(exists=True, file_okay=False),
+    help="Where to look for labels (default: ROOT/derivatives).",
+)
+@click.option(
+    "--session",
+    default=None,
+    help="Restrict to a single session label (without the 'ses-' prefix).",
+)
+@click.option(
+    "--no-require-labels",
+    is_flag=True,
+    help="Include image-only entries instead of requiring a matching label.",
+)
+@click.option(
+    "--backend",
+    default="auto",
+    type=click.Choice(["auto", "pybids", "walker"]),
+    help="Discovery backend. 'walker' needs no optional dependencies.",
+    **_option_kwds,
+)
+@click.option("--json", "as_json", is_flag=True, help="Print entries as JSON.")
+def data_from_bids(
+    *,
+    root,
+    output,
+    suffix,
+    label_suffix,
+    derivatives_dir,
+    session,
+    no_require_labels,
+    backend,
+    as_json,
+):
+    """Scan a BIDS dataset and write a DataSpec manifest.
+
+    ROOT is a BIDS dataset directory (containing sub-* directories).
+    OUTPUT is the manifest JSON file to write.
+    """
+    from collections import Counter as _Counter
+    import json as _json
+
+    from ..data.bids import scan_bids
+    from ..data.spec import DataSpec
+
+    try:
+        result = scan_bids(
+            root,
+            suffix=suffix,
+            label_suffix=label_suffix,
+            derivatives_dir=derivatives_dir,
+            session=session,
+            require_labels=not no_require_labels,
+            backend=backend,
+        )
+    except (FileNotFoundError, ValueError, ImportError) as exc:
+        click.echo(click.style(f"ERROR: {exc}", fg="red"))
+        sys.exit(1)
+
+    spec = DataSpec(entries=result.entries)
+    spec.to_json(output)
+    skip_histogram = dict(_Counter(s.reason.value for s in result.skipped))
+
+    if as_json:
+        click.echo(
+            _json.dumps(
+                {
+                    "entries": spec.entries,
+                    "n_entries": len(spec.entries),
+                    "skipped": skip_histogram,
+                },
+                indent=2,
+            )
+        )
+    else:
+        click.echo(
+            click.style(f"Wrote {len(spec.entries)} entries to {output}", fg="green")
+        )
+        if skip_histogram:
+            click.echo(f"Skipped: {skip_histogram}")
+
+
+@data.command("to-bids")
+@click.argument("manifest", type=click.Path(exists=True))
+@click.argument("output", type=click.Path())
+@click.option(
+    "--dataset-name",
+    default="nobrainer dataset",
+    help="Name for dataset_description.json.",
+    **_option_kwds,
+)
+@click.option(
+    "--suffix",
+    default="T1w",
+    help="Raw anat suffix to write images as.",
+    **_option_kwds,
+)
+@click.option(
+    "--desc",
+    default="nobrainer",
+    help="desc- entity value for written label files.",
+    **_option_kwds,
+)
+@click.option(
+    "--overwrite",
+    is_flag=True,
+    help="Allow writing into a non-empty OUTPUT directory.",
+)
+@click.option("--json", "as_json", is_flag=True, help="Print the write report as JSON.")
+def data_to_bids(*, manifest, output, dataset_name, suffix, desc, overwrite, as_json):
+    """Reshape a DataSpec manifest into a BIDS(-Derivatives) tree.
+
+    MANIFEST is a JSON manifest file (as written by 'from-bids' or by hand).
+    OUTPUT is the BIDS root directory to create. Writes symlinks only,
+    never copies.
+    """
+    import json as _json
+
+    from ..data.bids import to_bids as _to_bids
+    from ..data.spec import DataSpec
+
+    spec = DataSpec.from_json(manifest)
+    try:
+        report = _to_bids(
+            spec.entries,
+            output,
+            dataset_name=dataset_name,
+            suffix=suffix,
+            desc=desc,
+            overwrite=overwrite,
+        )
+    except (FileExistsError, ValueError) as exc:
+        click.echo(click.style(f"ERROR: {exc}", fg="red"))
+        sys.exit(1)
+
+    if as_json:
+        payload = {
+            "out_root": report.out_root,
+            "n_written": report.n_written,
+            "skipped": [
+                {"path": s.path, "reason": s.reason.value, "detail": s.detail}
+                for s in report.skipped
+            ],
+            "subject_mapping": [
+                {
+                    "entry_index": m.entry_index,
+                    "subject_label": m.subject_label,
+                    "strategy": m.strategy,
+                }
+                for m in report.subject_mapping
+            ],
+        }
+        click.echo(_json.dumps(payload, indent=2))
+    else:
+        click.echo(
+            click.style(f"Wrote {report.n_written} subject(s) to {output}", fg="green")
+        )
+        for s in report.skipped:
+            click.echo(
+                click.style(
+                    f"  skipped {s.path}: {s.reason.value} ({s.detail})", fg="yellow"
+                )
+            )
+
+
 # For debugging only.
 if __name__ == "__main__":
     cli()
