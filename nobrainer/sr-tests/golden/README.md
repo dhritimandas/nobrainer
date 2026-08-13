@@ -97,3 +97,33 @@ reachable from this repo (no `hf_hub`, `torch.hub`, or pinned download exists
 for a brain-extraction checkpoint). If/when one exists, a second test module
 following this same sha256-fast-path + tolerance-fallback pattern, gated
 behind an opt-in marker or environment variable, is the natural next step.
+
+## `golden_kwyk_meshnet.npz`
+
+Same pattern, for `kwyk_meshnet` (the architecture packaged by the kwyk
+MONAI bundle, `scripts/kwyk_reproduction/08_package_bundle.py`). See
+`generate_golden_kwyk.py` and `test_golden_kwyk.py`.
+
+Differences from `golden_brain_extraction.npz`:
+- **3 classes** (background, shell, core — two concentric spheres), not 2,
+  since the real kwyk checkpoints are multi-class (50 classes).
+- **`block_shape=(32,32,32)`**, kwyk's real fixed SavedModel input size
+  (verified against a live container — see `docs/kwyk_parity_report.md`),
+  not an arbitrary small block size.
+- **`mc=False` explicitly** during training and prediction — `KWYKMeshNet`'s
+  default `forward()` (`mc=None`) samples its variational weight
+  distribution, so calling it without `mc=False` would make even this
+  golden fixture non-deterministic. `predict()` does this automatically via
+  `model_supports_mc`; `generate_golden_kwyk.py`'s training loop passes it
+  explicitly. `test_golden_kwyk.py::test_deterministic_path_is_reproducible`
+  pins that this stays true.
+- **Not the real converted kwyk weights.** Those are a ~12 MB pretrained
+  checkpoint (`nobrainer.datasets.convert_kwyk`'s output) — a model weights
+  file, which this repo's conventions exclude from commits, and far over
+  the 500 KB fixture size limit besides. This fixture instead hermetically
+  trains a tiny `kwyk_meshnet` from scratch, same as the UNet fixture: it
+  validates the architecture's `predict()` integration and `mc=False`
+  determinism, not any specific checkpoint's segmentation quality. The
+  actual converted checkpoint's numerical fidelity is validated separately,
+  against a live `neuronets/kwyk` container — see
+  `docs/kwyk_parity_report.md`.
