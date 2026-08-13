@@ -38,6 +38,7 @@ class _VWNLayerBernoulli(nn.Module):
         dilation: int,
         dropout_rate: float,
         sigma_init: float,
+        bias: bool = False,
     ) -> None:
         super().__init__()
         self.conv = FFGConv3d(
@@ -46,7 +47,7 @@ class _VWNLayerBernoulli(nn.Module):
             kernel_size=3,
             padding=dilation,
             dilation=dilation,
-            bias=False,
+            bias=bias,
             sigma_init=sigma_init,
         )
         self.dropout = nn.Dropout3d(p=dropout_rate)
@@ -75,6 +76,7 @@ class _VWNLayerConcrete(nn.Module):
         sigma_init: float,
         concrete_temperature: float = 0.02,
         concrete_init_p: float = 0.9,
+        bias: bool = False,
     ) -> None:
         super().__init__()
         self.conv = FFGConv3d(
@@ -83,7 +85,7 @@ class _VWNLayerConcrete(nn.Module):
             kernel_size=3,
             padding=dilation,
             dilation=dilation,
-            bias=False,
+            bias=bias,
             sigma_init=sigma_init,
         )
         self.dropout = ConcreteDropout3d(
@@ -131,6 +133,18 @@ class KWYKMeshNet(nn.Module):
         Temperature for concrete dropout (default 0.02).
     concrete_init_p : float
         Initial dropout probability for concrete dropout (default 0.9).
+    bias : bool
+        Whether the hidden-layer FFG convolutions carry a bias term
+        (``bias_m`` / ``bias_a``).  Default ``False`` (the from-scratch
+        training default).  Note the **published kwyk checkpoints DO carry
+        ``bias_m``/``bias_a`` for every conv layer** — verified against the
+        ``neuronets/kwyk`` container, see
+        ``docs/kwyk_mapping_verification.md`` — so importing them requires
+        ``bias=True`` (``nobrainer/datasets/convert_kwyk.py`` builds the
+        model that way by default); a strict state_dict load rejects the
+        bias keys against a bias-free model.  The output ``classifier`` is
+        unaffected by this flag: it always carries its bias, matching both
+        the TF ``logits/`` layer and the previous ``nn.Conv3d`` behaviour.
     """
 
     def __init__(
@@ -144,6 +158,7 @@ class KWYKMeshNet(nn.Module):
         sigma_init: float = 1e-4,
         concrete_temperature: float = 0.02,
         concrete_init_p: float = 0.9,
+        bias: bool = False,
     ) -> None:
         super().__init__()
         if receptive_field not in _DILATION_SCHEDULES:
@@ -165,6 +180,7 @@ class KWYKMeshNet(nn.Module):
                     sigma_init,
                     concrete_temperature,
                     concrete_init_p,
+                    bias=bias,
                 )
             else:
                 layer = _VWNLayerBernoulli(
@@ -173,10 +189,21 @@ class KWYKMeshNet(nn.Module):
                     dil,
                     dropout_rate,
                     sigma_init,
+                    bias=bias,
                 )
             setattr(self, f"layer_{i}", layer)
 
-        self.classifier = nn.Conv3d(filters, n_classes, kernel_size=1)
+        # The output layer is itself a VWN (FFG) conv, exactly like the TF
+        # original's ``logits/conv3d/*`` layer (a full VWN conv with bias --
+        # verified against the neuronets/kwyk container, see
+        # docs/kwyk_mapping_verification.md, discrepancy D2). A plain
+        # nn.Conv3d here could represent only the mean path, making MC
+        # uncertainty systematically under-dispersed at the output. bias is
+        # unconditional: the TF logits layer always has one, and so did the
+        # previous nn.Conv3d default.
+        self.classifier = FFGConv3d(
+            filters, n_classes, kernel_size=1, bias=True, sigma_init=sigma_init
+        )
 
     def forward(
         self,
@@ -213,7 +240,9 @@ class KWYKMeshNet(nn.Module):
         h = x
         for i in range(self._n_layers):
             h = getattr(self, f"layer_{i}")(h, mc_vwn=mc_vwn, mc_dropout=mc_dropout)
-        return self.classifier(h)
+        # The classifier follows the same VWN sampling switch as the hidden
+        # convs: stochastic under mc_vwn=True, mean path under mc_vwn=False.
+        return self.classifier(h, mc=mc_vwn)
 
     def kl_divergence(self) -> torch.Tensor:
         """Sum KL divergence from all VWN conv layers."""
@@ -242,9 +271,17 @@ def kwyk_meshnet(
     sigma_init: float = 1e-4,
     concrete_temperature: float = 0.02,
     concrete_init_p: float = 0.9,
+    bias: bool = False,
     **kwargs,
 ) -> KWYKMeshNet:
-    """Factory function for :class:`KWYKMeshNet`."""
+    """Factory function for :class:`KWYKMeshNet`.
+
+    ``bias`` defaults to ``False`` (the from-scratch training default). The
+    published kwyk checkpoints DO carry ``bias_m``/``bias_a`` for every conv
+    layer (verified against the ``neuronets/kwyk`` container -- see
+    ``docs/kwyk_mapping_verification.md``), so pass ``bias=True`` when
+    importing them; ``nobrainer/datasets/convert_kwyk.py`` does so by default.
+    """
     return KWYKMeshNet(
         n_classes=n_classes,
         in_channels=in_channels,
@@ -255,6 +292,7 @@ def kwyk_meshnet(
         sigma_init=sigma_init,
         concrete_temperature=concrete_temperature,
         concrete_init_p=concrete_init_p,
+        bias=bias,
     )
 
 

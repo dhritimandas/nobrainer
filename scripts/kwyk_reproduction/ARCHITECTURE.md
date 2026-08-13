@@ -112,7 +112,9 @@ Two terms per filter:
 - Layer 5: dilation=4
 - Layer 6: dilation=8
 - Layer 7: dilation=1
-- Layer 8 (logits): 1×1×1, 50 filters, Softmax
+- Layer 8 (logits): 1×1×1, 50 filters, Softmax — "Layer 8" is positional
+  only; in the SavedModel its variables live under their own `logits/conv3d/*`
+  namespace (not `layer_8/`), and it is itself a full VWN conv with bias
 
 Receptive field = 37 voxels.
 

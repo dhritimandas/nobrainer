@@ -30,6 +30,16 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Clamp range for concrete-dropout probabilities, applied on every read of
+# ``ConcreteDropout3d.p``. Widened from the original [0.05, 0.95]: the
+# published kwyk SSD checkpoint stores trained p values up to 0.954055, so a
+# 0.95 ceiling silently clipped 89% of them (598/672) on weight import
+# (docs/kwyk_mapping_verification.md, discrepancy D3). The converter in
+# ``nobrainer/datasets/convert_kwyk.py`` mirrors these bounds; a unit test
+# asserts the two stay in sync.
+CONCRETE_P_MIN: float = 0.01
+CONCRETE_P_MAX: float = 0.99
+
 
 class FFGConv3d(nn.Module):
     """3-D convolution with Variational Weight Normalization + learned sigma.
@@ -198,8 +208,13 @@ class ConcreteDropout3d(nn.Module):
 
     @property
     def p(self) -> torch.Tensor:
-        """Per-filter dropout probabilities, clamped to [0.05, 0.95]."""
-        return torch.sigmoid(self.p_logit).clamp(0.05, 0.95)
+        """Per-filter dropout probabilities, clamped to the module range.
+
+        The clamp bounds are the module constants ``CONCRETE_P_MIN`` /
+        ``CONCRETE_P_MAX``; see their definition for why the range must be
+        wide enough to represent the published kwyk checkpoints.
+        """
+        return torch.sigmoid(self.p_logit).clamp(CONCRETE_P_MIN, CONCRETE_P_MAX)
 
     def forward(self, x: torch.Tensor, mc: bool = True) -> torch.Tensor:
         """Apply concrete dropout (Eq. 10).
