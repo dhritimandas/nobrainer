@@ -846,6 +846,87 @@ def zarr_suggest_shards(n_volumes, volume_shape, dtype, n_input_files, levels):
     click.echo(json.dumps(result, indent=2))
 
 
+# ---------------------------------------------------------------------------
+# provenance subcommands
+# ---------------------------------------------------------------------------
+
+
+@cli.group()
+def provenance():
+    """Emit training-run provenance as PROV-O RDF."""
+
+
+@provenance.command("export")
+@click.option(
+    "--bundle",
+    required=True,
+    type=click.Path(exists=True, file_okay=False),
+    help="Segmentation.save() directory (model.pth + croissant.json).",
+    **_option_kwds,
+)
+@click.option(
+    "--dataspec",
+    default=None,
+    type=click.Path(exists=True, dir_okay=False),
+    help="Optional DataSpec manifest JSON for image+label dataset provenance.",
+    **_option_kwds,
+)
+@click.option(
+    "--out",
+    default=None,
+    type=click.Path(),
+    help="Output file path. Omit to write to stdout.",
+)
+@click.option(
+    "--format",
+    "fmt",
+    type=click.Choice(["turtle", "json-ld"]),
+    default="turtle",
+    help="Serialization format.",
+    **_option_kwds,
+)
+@click.option(
+    "--base-iri",
+    default="https://neuronets.dev/nobrainer/",
+    help="Base IRI for minted instance identifiers.",
+    **_option_kwds,
+)
+@click.option(
+    "--agent",
+    default=None,
+    help="Optional caller-supplied human/organization agent identity "
+    "('Name <email>' or an IRI).",
+)
+@click.option(
+    "--strict",
+    is_flag=True,
+    help="Fail instead of eliding unrepresentable values.",
+)
+def provenance_export(*, bundle, dataspec, out, fmt, base_iri, agent, strict):
+    """Export PROV-O RDF provenance for a saved nobrainer training run."""
+    from ..provenance import ProvenanceError, export_provenance
+
+    try:
+        text = export_provenance(
+            bundle,
+            dataspec_path=dataspec,
+            fmt=fmt,
+            base_iri=base_iri,
+            agent=agent,
+            strict=strict,
+        )
+    except ProvenanceError as exc:
+        click.echo(click.style(f"ERROR: {exc}", fg="red"))
+        raise SystemExit(1) from exc
+
+    if out:
+        with open(out, "w") as fh:
+            fh.write(text)
+        click.echo(f"Wrote {fmt} provenance to {out}")
+    else:
+        click.echo(text)
+
+
 # For debugging only.
 if __name__ == "__main__":
     cli()

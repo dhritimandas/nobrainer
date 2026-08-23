@@ -62,11 +62,12 @@ generative = ["pytorch-lightning >= 2.0"]
 lightning = ["pytorch-lightning >= 2.0"]
 zarr = ["zarr >= 3.0", "nifti-zarr", "ome-zarr >= 0.14.0", "dask[array]", "scipy >= 1.11"]
 croissant = ["mlcroissant"]
+provenance = ["rdflib >= 7.0"]
 versioning = ["datalad >= 0.19"]
 tfrecord = ["tfrecord >= 1.14"]
 dev = ["pre-commit", "pytest", "pytest-cov", "scipy"]
 all = [
-    "nobrainer[bayesian,generative,zarr,croissant,versioning,tfrecord,dev]",
+    "nobrainer[bayesian,generative,zarr,croissant,provenance,versioning,tfrecord,dev]",
 ]
 
 [tool.hatch.version]
